@@ -27,6 +27,9 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/coreos/etcd/client"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -51,6 +54,25 @@ func runChild(cmd string, args []string, signals <-chan os.Signal) (err error) {
 		}
 	}()
 	return child.Wait()
+}
+
+func initETCdClient(updateTimeout time.Duration) error {
+	cfg := client.Config{
+		Endpoints:               []string{"http://127.0.0.1:2379"},
+		Transport:               client.DefaultTransport,
+		HeaderTimeoutPerRequest: updateTimeout,
+	}
+	c, err := client.New(cfg)
+	if err != nil {
+		return err
+	}
+	kapi := client.NewKeysAPI(c)
+	if resp, err := kapi.Set(context.Background(), "/foo", "bar", nil); err != nil {
+		log.Fatal(err)
+	} else {
+		log.Printf("Set is done. Metadata is %q\n", resp)
+	}
+	return nil
 }
 
 func acquireLock(lockfile string, ttl time.Duration) (err error) {
@@ -91,6 +113,10 @@ func main() {
 	}
 
 	ttl := time.Duration(*updateInterval+*updateTimeout+*gracePeriod+*killDelay) * time.Second
+
+	if err := initETCdClient(time.Duration(*updateTimeout) * time.Second); err != nil {
+		log.Fatal("error connecting to etcd:", err)
+	}
 
 	if err := acquireLock(lockfilePath, ttl); err != nil {
 		log.Fatal("singleton-runner: unable to acquier lock:", err)
