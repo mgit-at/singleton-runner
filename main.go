@@ -37,7 +37,7 @@ const (
 	LOCK_FILE_BASE = "/singleton.mgit.at"
 )
 
-func runChild(cmd string, args []string, signals <-chan os.Signal) (err error) {
+func runChild(cmd string, args []string, signals <-chan os.Signal) (exited chan bool, err error) {
 	child := exec.Cmd{}
 	child.Path = cmd
 	child.Args = args
@@ -46,15 +46,28 @@ func runChild(cmd string, args []string, signals <-chan os.Signal) (err error) {
 	child.Stderr = os.Stderr
 
 	if err = child.Start(); err != nil {
-		return err
+		return
 	}
+
+	exited = make(chan bool, 1)
+	go func() {
+		defer func() {
+			exited <- true
+		}()
+		err := child.Wait()
+		if err != nil {
+			log.Printf("singleton-runner: child exited with: %v", err)
+		} else {
+			log.Printf("singleton-runner: child exited normally")
+		}
+	}()
 
 	go func() {
 		for sig := range signals {
 			child.Process.Signal(sig)
 		}
 	}()
-	return child.Wait()
+	return
 }
 
 func initETCdClient(timeout time.Duration) (client.KeysAPI, error) {
@@ -122,6 +135,9 @@ func updateLock(kapi client.KeysAPI, lockfile, instanceID string, ttl, timeout t
 }
 
 func main() {
+	//
+	// **** parse command line
+	//
 	var nameTemplate = flag.String("name-template", "", "template for the lockfile name (will get expanded using environment variables)")
 	var instTemplate = flag.String("instance-template", "", "template for the instance name (will get expanded using environment variables)")
 	var updateInterval = flag.Uint("update-interval", 30, "interval in seconds between lock file update requests")
@@ -150,6 +166,9 @@ func main() {
 		log.Fatal("singleton-runner: please specify a command to run")
 	}
 
+	//
+	// **** initialization
+	//
 	ttl := time.Duration(*updateInterval+*requestTimeout+*gracePeriod+*killDelay) * time.Second
 	etcdTimeout := time.Duration(*requestTimeout) * time.Second
 
@@ -159,27 +178,28 @@ func main() {
 	}
 	// defer releaseLock(kapi, lockfilePath, instanceID) // should this be done in any case?
 
+	//
+	// **** try to get the lock
+	//
 	if err := acquireLock(kapi, lockfilePath, instanceID, ttl, etcdTimeout); err != nil {
 		log.Fatal("singleton-runner: unable to acquire lock: ", err)
 	}
-
 	log.Printf("singleton-runner: lock acquired successfully! .. starting %q", cmd)
-	exited := make(chan bool, 1)
 
+	//
+	// **** run the child
+	//
 	signals := make(chan os.Signal)
 	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM)
-	go func() {
-		defer func() {
-			exited <- true
-		}()
-		err := runChild(cmd, args, signals)
-		if err != nil {
-			log.Printf("singleton-runner: child exited with: %v", err)
-		} else {
-			log.Printf("singleton-runner: child exited normally")
-		}
-	}()
+	exited, err := runChild(cmd, args, signals)
+	if err != nil {
+		releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
+		log.Fatal("singleton-runner: calling child failed:", err)
+	}
 
+	//
+	// **** update the lock - wait for child to exit
+	//
 	t := time.NewTicker(time.Duration(*updateInterval) * time.Second)
 	for {
 		select {
