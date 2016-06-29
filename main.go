@@ -92,23 +92,45 @@ func IsKeyExists(err error) bool {
 }
 
 func acquireLock(kapi client.KeysAPI, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
-	log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
+	for {
+		log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	opts := &client.SetOptions{PrevExist: client.PrevNoExist, TTL: ttl, Refresh: false}
-	_, err = kapi.Set(ctx, lockfile, instanceID, opts)
-	cancel()
-	if err == nil {
-		return
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		opts := &client.SetOptions{PrevExist: client.PrevNoExist, TTL: ttl, Refresh: false}
+		_, err = kapi.Set(ctx, lockfile, instanceID, opts)
+		cancel()
+		if err == nil {
+			return // we got the lock!
+		}
+		if !IsKeyExists(err) {
+			return // this seems to be a severe problem.. better give up
+		}
+		log.Printf("singleton-runner: lock is already acquired - watching for changes")
+
+		ctx, cancel = context.WithTimeout(context.Background(), ttl)
+		watcher := kapi.Watcher(lockfile, nil)
+	WatchLock:
+		for {
+			resp, err := watcher.Next(ctx)
+			if err != nil {
+				log.Printf("singleton-runner: watching for events failed: %v", err)
+				return err
+			}
+			switch resp.Action {
+			case "expire":
+				fallthrough
+			case "compareAndDelete":
+				fallthrough
+			case "delete":
+				log.Printf("singleton-runner: delete or expire event - try again!")
+				break WatchLock
+			case "compareAndSwap":
+				return errors.New("locked instance seems to be alive - giving up")
+			default:
+				log.Printf("singleton-runner: ignoring unknown event '%s'", resp.Action)
+			}
+		}
 	}
-	if !IsKeyExists(err) {
-		return
-	}
-	log.Printf("singleton-runner: lock is already acquired - watching for changes")
-	err = errors.New("watching lockfile not yet implemented!")
-	// TODO: attach to lockfile and wait for updated/deleted event
-	// when updated exit
-	// when deleted try again
 	return
 }
 
@@ -190,7 +212,7 @@ func main() {
 	// **** run the child
 	//
 	signals := make(chan os.Signal)
-	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM)
+	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 	exited, err := runChild(cmd, args, signals)
 	if err != nil {
 		releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
@@ -227,7 +249,7 @@ Loop:
 		log.Println("singleton-runner: grace period elapsed sending child the KILL signal")
 		signals <- syscall.SIGKILL
 	case <-exited:
-		log.Println("singleton-runner: closing...")
+		log.Println("singleton-runner: exiting after child stopped")
 		releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
 		return
 	}
