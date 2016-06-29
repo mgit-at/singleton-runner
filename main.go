@@ -18,6 +18,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -33,7 +34,7 @@ import (
 )
 
 const (
-	LOCK_FILE_BASE = "/singleton.mgit.at/"
+	LOCK_FILE_BASE = "/singleton.mgit.at"
 )
 
 func runChild(cmd string, args []string, signals <-chan os.Signal) (err error) {
@@ -56,34 +57,50 @@ func runChild(cmd string, args []string, signals <-chan os.Signal) (err error) {
 	return child.Wait()
 }
 
-func initETCdClient(updateTimeout time.Duration) error {
+func initETCdClient(updateTimeout time.Duration) (client.KeysAPI, error) {
 	cfg := client.Config{
-		Endpoints:               []string{"http://127.0.0.1:2379"},
+		Endpoints:               []string{"http://127.0.0.1:2379"}, // TODO: make this configurable
 		Transport:               client.DefaultTransport,
 		HeaderTimeoutPerRequest: updateTimeout,
 	}
 	c, err := client.New(cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	kapi := client.NewKeysAPI(c)
-	if resp, err := kapi.Set(context.Background(), "/foo", "bar", nil); err != nil {
-		log.Fatal(err)
-	} else {
-		log.Printf("Set is done. Metadata is %q\n", resp)
-	}
-	return nil
+	return kapi, err
 }
 
-func acquireLock(lockfile string, ttl time.Duration) (err error) {
-	log.Printf("trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
-	// TODO: try to create lock file, if it exists attach to it and wait for updated/deleted event
+func IsKeyExists(err error) bool {
+	if cErr, ok := err.(client.Error); ok {
+		return cErr.Code == client.ErrorCodeNodeExist
+	}
+	return false
+}
+
+func acquireLock(kapi client.KeysAPI, lockfile string, ttl time.Duration) (err error) {
+	log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
+
+	opts := &client.SetOptions{PrevExist: client.PrevNoExist, TTL: ttl, Refresh: false}
+	if _, err = kapi.Set(context.Background(), lockfile, "kubernetes-pod-id", opts); err == nil { // TODO: use kubernetes pod name as value...
+		return
+	}
+	if !IsKeyExists(err) {
+		return
+	}
+	log.Printf("singleton-runner: lock is already acquired - watching for changes")
+	err = errors.New("watching lockfile not yet implemented!")
+	// TODO: attach to lockfile and wait for updated/deleted event
 	// when updated exit
 	// when deleted try again
 	return
 }
 
-func updateLock(lockfile string, ttl, timeout time.Duration) (err error) {
+func releaseLock(kapi client.KeysAPI, lockfile string) {
+	log.Printf("trying to release lock: %s", lockfile)
+}
+
+func updateLock(kapi client.KeysAPI, lockfile string, ttl, timeout time.Duration) (err error) {
 	log.Printf("trying to update lock: %s (TTL: %v, Timeout: %v)", lockfile, ttl, timeout)
 	// Try to update the lock: return err if this fails
 	return
@@ -114,13 +131,17 @@ func main() {
 
 	ttl := time.Duration(*updateInterval+*updateTimeout+*gracePeriod+*killDelay) * time.Second
 
-	if err := initETCdClient(time.Duration(*updateTimeout) * time.Second); err != nil {
+	kapi, err := initETCdClient(time.Duration(*updateTimeout) * time.Second)
+	if err != nil {
 		log.Fatal("error connecting to etcd:", err)
 	}
+	// defer releaseLock(kapi, lockfilePath) // should this be done in any case?
 
-	if err := acquireLock(lockfilePath, ttl); err != nil {
-		log.Fatal("singleton-runner: unable to acquier lock:", err)
+	if err := acquireLock(kapi, lockfilePath, ttl); err != nil {
+		log.Fatal("singleton-runner: unable to acquire lock: ", err)
 	}
+
+	log.Printf("singleton-runner: lock acquired successfully! .. starting %q", cmd)
 	exited := make(chan bool, 1)
 
 	signals := make(chan os.Signal)
@@ -141,13 +162,14 @@ func main() {
 	for {
 		select {
 		case <-t.C:
-			if err := updateLock(lockfilePath, ttl, time.Duration(*updateTimeout)*time.Second); err != nil {
+			if err := updateLock(kapi, lockfilePath, ttl, time.Duration(*updateTimeout)*time.Second); err != nil {
 				log.Println("singleton-runner: updateting lock failed:", err)
 				// send TERM signal to client
 				// if after gracePeriod child is still running send a KILL signal
 			}
 		case <-exited:
 			log.Println("singleton-runner: closing...")
+			releaseLock(kapi, lockfilePath) // remove here if we do this using the defer above
 			return
 		}
 	}
