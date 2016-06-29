@@ -198,21 +198,37 @@ func main() {
 	}
 
 	//
-	// **** update the lock - wait for child to exit
+	// **** update the lock - release lock if child exits
 	//
 	t := time.NewTicker(time.Duration(*updateInterval) * time.Second)
+Loop:
 	for {
 		select {
 		case <-t.C:
 			if err := updateLock(kapi, lockfilePath, instanceID, ttl, etcdTimeout); err != nil {
 				log.Println("singleton-runner: updateting lock failed:", err)
+				log.Println("singleton-runner: sending child the TERM signal")
 				signals <- syscall.SIGTERM
-				// if after gracePeriod child is still running send a KILL signal
+				break Loop
 			}
 		case <-exited:
 			log.Println("singleton-runner: closing...")
 			releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
 			return
 		}
+	}
+
+	//
+	// **** wait for child to exit - kill it after grace period
+	//
+	k := time.NewTimer(time.Duration(*gracePeriod) * time.Second)
+	select {
+	case <-k.C:
+		log.Println("singleton-runner: grace period elapsed sending child the KILL signal")
+		signals <- syscall.SIGKILL
+	case <-exited:
+		log.Println("singleton-runner: closing...")
+		releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
+		return
 	}
 }
