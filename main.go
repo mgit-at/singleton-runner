@@ -18,23 +18,47 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
+	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/coreos/etcd/client"
+	etcd "github.com/coreos/etcd/client"
 	"golang.org/x/net/context"
 )
 
 const (
 	LOCK_FILE_BASE = "/singleton.mgit.at"
+)
+
+var (
+// Machines contains a list of all etcd machines (http address)
+)
+
+// command line flags
+var (
+	flagNameTemplate   = flag.String("name-template", "", "template for the lockfile name (will get expanded using environment variables)")
+	flagInstTemplate   = flag.String("instance-template", "", "template for the instance name (will get expanded using environment variables)")
+	flagRequestTimeout = flag.Uint("request-timeout", 5, "timeout in seconds to wait for responses from etcd")
+	flagUpdateInterval = flag.Uint("update-interval", 30, "interval in seconds between lock file update requests")
+	flagGracePeriod    = flag.Uint("grace-period", 30, "time in seconds to wait for a normal shutdown of the child")
+	flagKillBackoff    = flag.Uint("kill-delay", 5, "")
+	flagEtcd           = flag.String("etcd", "http://127.0.0.1:2379", "etcd machines (comma separated list)")
+	flagCA             = flag.String("ca", "", "CA certificate")
+	flagCert           = flag.String("cert", "", "client certificate")
+	flagKey            = flag.String("key", "", "client key")
 )
 
 func runChild(cmd string, args []string, signals <-chan os.Signal) (exited chan bool, err error) {
@@ -70,33 +94,61 @@ func runChild(cmd string, args []string, signals <-chan os.Signal) (exited chan 
 	return
 }
 
-func initETCdClient(timeout time.Duration) (client.KeysAPI, error) {
-	cfg := client.Config{
-		Endpoints:               []string{"http://127.0.0.1:2379"}, // TODO: make this configurable
-		Transport:               client.DefaultTransport,
-		HeaderTimeoutPerRequest: timeout,
+func initETCdClient(machines []string, CA, cert, key string, timeout time.Duration) (etcd.KeysAPI, error) {
+	var tlsConfig *tls.Config
+	if cert != "" && key != "" && CA != "" {
+		cert, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			log.Fatal("failed to load client key pair:", err)
+		}
+		caCert, err := ioutil.ReadFile(CA)
+		if err != nil {
+			log.Fatal("failed to load CA:", err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      caCertPool,
+		}
+		tlsConfig.BuildNameToCertificate()
 	}
-	c, err := client.New(cfg)
+
+	cfg := etcd.Config{
+		Endpoints: machines,
+		Transport: &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: tlsConfig,
+			Dial: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+		HeaderTimeoutPerRequest: 5 * time.Second,
+	}
+
+	c, err := etcd.New(cfg)
 	if err != nil {
 		return nil, err
 	}
-	kapi := client.NewKeysAPI(c)
+	kapi := etcd.NewKeysAPI(c)
 	return kapi, err
 }
 
 func IsKeyExists(err error) bool {
-	if cErr, ok := err.(client.Error); ok {
-		return cErr.Code == client.ErrorCodeNodeExist
+	if cErr, ok := err.(etcd.Error); ok {
+		return cErr.Code == etcd.ErrorCodeNodeExist
 	}
 	return false
 }
 
-func acquireLock(kapi client.KeysAPI, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
+func acquireLock(kapi etcd.KeysAPI, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
 	for {
 		log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
 
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		opts := &client.SetOptions{PrevExist: client.PrevNoExist, TTL: ttl, Refresh: false}
+		opts := &etcd.SetOptions{PrevExist: etcd.PrevNoExist, TTL: ttl, Refresh: false}
 		_, err = kapi.Set(ctx, lockfile, instanceID, opts)
 		cancel()
 		if err == nil {
@@ -134,10 +186,10 @@ func acquireLock(kapi client.KeysAPI, lockfile, instanceID string, ttl, timeout 
 	return
 }
 
-func releaseLock(kapi client.KeysAPI, lockfile, instanceID string) {
+func releaseLock(kapi etcd.KeysAPI, lockfile, instanceID string) {
 	log.Printf("singleton-runner: trying to release lock: %s", lockfile)
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	opts := &client.DeleteOptions{PrevValue: instanceID}
+	opts := &etcd.DeleteOptions{PrevValue: instanceID}
 	_, err := kapi.Delete(ctx, lockfile, opts)
 	cancel()
 	if err != nil {
@@ -146,11 +198,11 @@ func releaseLock(kapi client.KeysAPI, lockfile, instanceID string) {
 	return
 }
 
-func updateLock(kapi client.KeysAPI, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
+func updateLock(kapi etcd.KeysAPI, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
 	log.Printf("singleton-runner: trying to update lock: %s (TTL: %v, Timeout: %v)", lockfile, ttl, timeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	opts := &client.SetOptions{PrevValue: instanceID, PrevExist: client.PrevExist, TTL: ttl, Refresh: false}
+	opts := &etcd.SetOptions{PrevValue: instanceID, PrevExist: etcd.PrevExist, TTL: ttl, Refresh: false}
 	_, err = kapi.Set(ctx, lockfile, instanceID, opts)
 	cancel()
 	return
@@ -160,25 +212,29 @@ func main() {
 	//
 	// **** parse command line
 	//
-	var nameTemplate = flag.String("name-template", "", "template for the lockfile name (will get expanded using environment variables)")
-	var instTemplate = flag.String("instance-template", "", "template for the instance name (will get expanded using environment variables)")
-	var updateInterval = flag.Uint("update-interval", 30, "interval in seconds between lock file update requests")
-	var requestTimeout = flag.Uint("request-timeout", 5, "timeout in seconds to wait for responses from etcd")
-	var gracePeriod = flag.Uint("grace-period", 30, "time in seconds to wait for a normal shutdown of the child")
-	var killDelay = flag.Uint("kill-delay", 5, "")
-
 	flag.Parse()
 
-	if *nameTemplate == "" {
+	if *flagNameTemplate == "" {
 		log.Fatal("singleton-runner: '-name-template' is empty")
 	}
-	name := os.ExpandEnv(*nameTemplate)
+	name := os.ExpandEnv(*flagNameTemplate)
 	lockfilePath := filepath.Join(LOCK_FILE_BASE, path.Clean("/"+name))
 
-	if *instTemplate == "" {
+	if *flagInstTemplate == "" {
 		log.Fatal("singleton-runner: '-instance-template' is empty")
 	}
-	instanceID := os.ExpandEnv(*instTemplate)
+	instanceID := os.ExpandEnv(*flagInstTemplate)
+
+	requestTimeout := time.Duration(*flagRequestTimeout) * time.Second
+	updateInterval := time.Duration(*flagUpdateInterval) * time.Second
+	gracePeriod := time.Duration(*flagGracePeriod) * time.Second
+	killBackoff := time.Duration(*flagKillBackoff) * time.Second
+	ttl := updateInterval + requestTimeout + gracePeriod + killBackoff
+
+	machines := strings.Split(*flagEtcd, ",")
+	CA := *flagCA
+	cert := *flagCert
+	key := *flagKey
 
 	var cmd string
 	args := flag.Args()
@@ -191,10 +247,8 @@ func main() {
 	//
 	// **** initialization
 	//
-	ttl := time.Duration(*updateInterval+*requestTimeout+*gracePeriod+*killDelay) * time.Second
-	etcdTimeout := time.Duration(*requestTimeout) * time.Second
 
-	kapi, err := initETCdClient(etcdTimeout)
+	kapi, err := initETCdClient(machines, CA, cert, key, requestTimeout)
 	if err != nil {
 		log.Fatal("error connecting to etcd:", err)
 	}
@@ -203,7 +257,7 @@ func main() {
 	//
 	// **** try to get the lock
 	//
-	if err := acquireLock(kapi, lockfilePath, instanceID, ttl, etcdTimeout); err != nil {
+	if err := acquireLock(kapi, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
 		log.Fatal("singleton-runner: unable to acquire lock: ", err)
 	}
 	log.Printf("singleton-runner: lock acquired successfully! .. starting %q", cmd)
@@ -222,12 +276,12 @@ func main() {
 	//
 	// **** update the lock - release lock if child exits
 	//
-	t := time.NewTicker(time.Duration(*updateInterval) * time.Second)
+	t := time.NewTicker(updateInterval)
 Loop:
 	for {
 		select {
 		case <-t.C:
-			if err := updateLock(kapi, lockfilePath, instanceID, ttl, etcdTimeout); err != nil {
+			if err := updateLock(kapi, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
 				log.Println("singleton-runner: updateting lock failed:", err)
 				log.Println("singleton-runner: sending child the TERM signal")
 				signals <- syscall.SIGTERM
@@ -243,7 +297,7 @@ Loop:
 	//
 	// **** wait for child to exit - kill it after grace period
 	//
-	k := time.NewTimer(time.Duration(*gracePeriod) * time.Second)
+	k := time.NewTimer(gracePeriod)
 	select {
 	case <-k.C:
 		log.Println("singleton-runner: grace period elapsed sending child the KILL signal")
