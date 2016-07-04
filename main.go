@@ -54,7 +54,7 @@ var (
 	flagRequestTimeout = flag.Uint("request-timeout", 5, "timeout in seconds to wait for responses from etcd")
 	flagUpdateInterval = flag.Uint("update-interval", 30, "interval in seconds between lock file update requests")
 	flagGracePeriod    = flag.Uint("grace-period", 30, "time in seconds to wait for a normal shutdown of the child")
-	flagKillBackoff    = flag.Uint("kill-delay", 5, "")
+	flagKillBackoff    = flag.Uint("kill-backoff", 5, "")
 	flagEtcd           = flag.String("etcd", "http://127.0.0.1:2379", "etcd machines (comma separated list)")
 	flagCA             = flag.String("ca", "", "CA certificate")
 	flagCert           = flag.String("cert", "", "client certificate")
