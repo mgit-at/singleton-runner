@@ -3,3 +3,6 @@ import:
 - package: github.com/coreos/etcd
   subpackages:
   - clientv3
+- package: golang.org/x/net
+  subpackages:
+  - context

@@ -1,8 +1,52 @@
-hash: 5ea3c2fe2f83ab2c303f14cc283c0fdefcd9b864d32861458091e775bee3e12d
-updated: 2016-07-04T10:37:50.248762718+02:00
+hash: 1b5c3486d6c1b9a133c0fd606ed719e5b917593a0741bd06736c47170c00a13d
+updated: 2016-07-04T18:24:11.882386367+02:00
 imports:
+- name: github.com/cloudfoundry-incubator/candiedyaml
+  version: 99c3df83b51532e3615f851d8c2dbb638f5313bf
 - name: github.com/coreos/etcd
   version: b566ca225cf8d6231cde375f442f3c473bb4e294
   subpackages:
   - clientv3
+  - auth/authpb
+  - etcdserver/api/v3rpc/rpctypes
+  - etcdserver/etcdserverpb
+  - mvcc/mvccpb
+  - pkg/tlsutil
+- name: github.com/gengo/grpc-gateway
+  version: 04d03d2c0176f9060cc3da4945a71abc759648bc
+  subpackages:
+  - runtime
+  - utilities
+  - runtime/internal
+- name: github.com/ghodss/yaml
+  version: aa0c862057666179de291b67d9f093d12b5a8473
+- name: github.com/gogo/protobuf
+  version: 2752d97bbd91927dd1c43296dbf8700e50e2708c
+  subpackages:
+  - proto
+- name: github.com/golang/protobuf
+  version: 3852dcfda249c2097355a6aabb199a28d97b30df
+  subpackages:
+  - proto
+  - jsonpb
+- name: golang.org/x/net
+  version: b400c2eff1badec7022a8c8f5bea058b6315eed7
+  subpackages:
+  - context
+  - http2
+  - trace
+  - http2/hpack
+  - lex/httplex
+  - internal/timeseries
+- name: google.golang.org/grpc
+  version: a0ff1e78a98cd140c2d18a0210ab0a2a183a2b4c
+  subpackages:
+  - credentials
+  - grpclog
+  - metadata
+  - codes
+  - internal
+  - naming
+  - transport
+  - peer
 devImports: []
