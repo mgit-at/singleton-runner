@@ -90,7 +90,7 @@ func runChild(cmd string, args []string, signals <-chan os.Signal) (exited chan 
 	return
 }
 
-func initETCdClient(machines []string, CA, cert, key string, timeout time.Duration) (etcd.KV, error) {
+func initETCdClient(machines []string, CA, cert, key string, timeout time.Duration) (*etcd.Client, etcd.KV, error) {
 	var tlsConfig *tls.Config
 	if cert != "" && key != "" && CA != "" {
 		cert, err := tls.LoadX509KeyPair(cert, key)
@@ -118,10 +118,10 @@ func initETCdClient(machines []string, CA, cert, key string, timeout time.Durati
 
 	c, err := etcd.New(cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	kvc := etcd.NewKV(c)
-	return kvc, err
+	return c, kvc, err
 }
 
 // func IsKeyExists(err error) bool {
@@ -131,21 +131,22 @@ func initETCdClient(machines []string, CA, cert, key string, timeout time.Durati
 // 	return false
 // }
 
-func acquireLock(kvc etcd.KV, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
+func acquireLock(kvc etcd.KV, lockfile, instanceID string, ttl int64, timeout time.Duration) (lease etcd.Lease, err error) {
 	// for {
-	// 	log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
+	log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
 
-	// 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	// 	opts := &etcd.SetOptions{PrevExist: etcd.PrevNoExist, TTL: ttl, Refresh: false}
-	// 	_, err = kvc.Set(ctx, lockfile, instanceID, opts)
-	// 	cancel()
-	// 	if err == nil {
-	// 		return // we got the lock!
-	// 	}
-	// 	if !IsKeyExists(err) {
-	// 		return // this seems to be a severe problem.. better give up
-	// 	}
-	// 	log.Printf("singleton-runner: lock is already acquired - watching for changes")
+	// ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+	// opts := &etcd.SetOptions{PrevExist: etcd.PrevNoExist, TTL: ttl, Refresh: false}
+	// _, err = kvc.Set(ctx, lockfile, instanceID, opts)
+	// cancel()
+	// if err == nil {
+	// 	return // we got the lock!
+	// }
+	// if !IsKeyExists(err) {
+	// 	return // this seems to be a severe problem.. better give up
+	// }
+	// log.Printf("singleton-runner: lock is already acquired - watching for changes")
 
 	// 	ctx, cancel = context.WithTimeout(context.Background(), ttl)
 	// 	watcher := kvc.Watcher(lockfile, nil)
@@ -172,10 +173,10 @@ func acquireLock(kvc etcd.KV, lockfile, instanceID string, ttl, timeout time.Dur
 	// 	}
 	// }
 	// return
-	return errors.New("not yet implemented")
+	return nil, errors.New("not yet implemented")
 }
 
-func releaseLock(kvc etcd.KV, lockfile, instanceID string) {
+func releaseLock(lease etcd.Lease) {
 	// log.Printf("singleton-runner: trying to release lock: %s", lockfile)
 	// ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 	// opts := &etcd.DeleteOptions{PrevValue: instanceID}
@@ -187,7 +188,7 @@ func releaseLock(kvc etcd.KV, lockfile, instanceID string) {
 	// return
 }
 
-func updateLock(kvc etcd.KV, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
+func updateLock(lease etcd.Lease, timeout time.Duration) (err error) {
 	// log.Printf("singleton-runner: trying to update lock: %s (TTL: %v, Timeout: %v)", lockfile, ttl, timeout)
 
 	// ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -218,8 +219,8 @@ func main() {
 	requestTimeout := time.Duration(*flagRequestTimeout) * time.Second
 	updateInterval := time.Duration(*flagUpdateInterval) * time.Second
 	gracePeriod := time.Duration(*flagGracePeriod) * time.Second
-	killBackoff := time.Duration(*flagKillBackoff) * time.Second
-	ttl := updateInterval + requestTimeout + gracePeriod + killBackoff
+	//killBackoff := time.Duration(*flagKillBackoff) * time.Second
+	ttl := int64(*flagRequestTimeout + *flagUpdateInterval + *flagGracePeriod + *flagKillBackoff)
 
 	machines := strings.Split(*flagEtcd, ",")
 	CA := *flagCA
@@ -238,19 +239,21 @@ func main() {
 	// **** initialization
 	//
 
-	kvc, err := initETCdClient(machines, CA, cert, key, requestTimeout)
+	c, kvc, err := initETCdClient(machines, CA, cert, key, requestTimeout)
 	if err != nil {
 		log.Fatal("error connecting to etcd:", err)
 	}
-	// defer releaseLock(kvc, lockfilePath, instanceID) // should this be done in any case?
+	defer c.Close()
 
 	//
 	// **** try to get the lock
 	//
-	if err := acquireLock(kvc, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
+	var lease etcd.Lease
+	if lease, err = acquireLock(kvc, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
 		log.Fatal("singleton-runner: unable to acquire lock: ", err)
 	}
 	log.Printf("singleton-runner: lock acquired successfully! .. starting %q", cmd)
+	// defer releaseLock(lease) // should this be done in any case?
 
 	//
 	// **** run the child
@@ -259,7 +262,7 @@ func main() {
 	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 	exited, err := runChild(cmd, args, signals)
 	if err != nil {
-		releaseLock(kvc, lockfilePath, instanceID) // remove here if we do this using the defer above
+		releaseLock(lease) // remove here if we do this using the defer above
 		log.Fatal("singleton-runner: calling child failed:", err)
 	}
 
@@ -271,7 +274,7 @@ Loop:
 	for {
 		select {
 		case <-t.C:
-			if err := updateLock(kvc, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
+			if err := updateLock(lease, requestTimeout); err != nil {
 				log.Println("singleton-runner: updateting lock failed:", err)
 				log.Println("singleton-runner: sending child the TERM signal")
 				signals <- syscall.SIGTERM
@@ -279,7 +282,7 @@ Loop:
 			}
 		case <-exited:
 			log.Println("singleton-runner: closing...")
-			releaseLock(kvc, lockfilePath, instanceID) // remove here if we do this using the defer above
+			releaseLock(lease) // remove here if we do this using the defer above
 			return
 		}
 	}
@@ -294,7 +297,7 @@ Loop:
 		signals <- syscall.SIGKILL
 	case <-exited:
 		log.Println("singleton-runner: exiting after child stopped")
-		releaseLock(kvc, lockfilePath, instanceID) // remove here if we do this using the defer above
+		releaseLock(lease) // remove here if we do this using the defer above
 		return
 	}
 }
