@@ -29,8 +29,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -40,7 +38,7 @@ import (
 )
 
 const (
-	LOCK_FILE_BASE = "/singleton.mgit.at"
+	LOCK_FILE_PREFIX = "/singleton.mgit.at/"
 )
 
 // command line flags
@@ -57,8 +55,7 @@ var (
 	flagKey            = flag.String("key", "", "client key")
 )
 
-func runChild(cmd string, args []string, signals <-chan os.Signal) (exited chan bool, err error) {
-	child := exec.Cmd{}
+func runChild(cmd string, args []string) (child exec.Cmd, exited chan bool, err error) {
 	child.Path = cmd
 	child.Args = args
 	child.Stdin = os.Stdin
@@ -82,11 +79,6 @@ func runChild(cmd string, args []string, signals <-chan os.Signal) (exited chan 
 		}
 	}()
 
-	go func() {
-		for sig := range signals {
-			child.Process.Signal(sig)
-		}
-	}()
 	return
 }
 
@@ -123,37 +115,37 @@ func initETCdClient(machines []string, CA, cert, key string, timeout time.Durati
 	return c, err
 }
 
-// func IsKeyExists(err error) bool {
-// 	if cErr, ok := err.(etcd.Error); ok {
-// 		return cErr.Code == etcd.ErrorCodeNodeExist
-// 	}
-// 	return false
-// }
-
-func acquireLock(cli *etcd.Client, lockfile, instanceID string, ttl int64, timeout time.Duration) error {
+func acquireLock(cli *etcd.Client, lockfile, instanceID string, ttl int64, timeout time.Duration) (etcd.LeaseID, <-chan *etcd.LeaseKeepAliveResponse, error) {
 	// for {
 	log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	resp, err := cli.Grant(ctx, ttl)
-	cancel()
 	if err != nil {
-		return err
+		return etcd.NoLease, nil, err
 	}
 
-	log.Printf("singleton-runner: got lease with ID", resp.ID)
+	log.Printf("singleton-runner: got lease with ID: %v", resp.ID)
 
-	// opts := &etcd.SetOptions{PrevExist: etcd.PrevNoExist, TTL: ttl, Refresh: false}
-	// _, err = kvc.Set(ctx, lockfile, instanceID, opts)
-	// cancel()
-	// if err == nil {
-	// 	return // we got the lock!
-	// }
-	// if !IsKeyExists(err) {
-	// 	return // this seems to be a severe problem.. better give up
-	// }
-	// log.Printf("singleton-runner: lock is already acquired - watching for changes")
+	respTxn, err := cli.Txn(ctx).
+		If(etcd.Compare(etcd.Version(lockfile), "=", 0)).
+		Then(etcd.OpPut(lockfile, instanceID, etcd.WithLease(resp.ID))).Commit()
+	if err != nil {
+		return etcd.NoLease, nil, err
+	}
+	if respTxn.Succeeded {
+		ch, err := cli.KeepAlive(ctx, resp.ID)
+		if err != nil {
+			return etcd.NoLease, nil, err
+		}
 
+		return resp.ID, ch, nil
+	}
+
+	return etcd.NoLease, nil, errors.New("lock already acquired .. watching is not yet implemented")
+	//  log.Printf("singleton-runner: lock is already acquired - watching for changes")
 	// 	ctx, cancel = context.WithTimeout(context.Background(), ttl)
 	// 	watcher := kvc.Watcher(lockfile, nil)
 	// WatchLock:
@@ -179,30 +171,17 @@ func acquireLock(cli *etcd.Client, lockfile, instanceID string, ttl int64, timeo
 	// 	}
 	// }
 	// return
-	return errors.New("not yet implemented")
 }
 
-func releaseLock(lease etcd.Lease) {
-	// log.Printf("singleton-runner: trying to release lock: %s", lockfile)
-	// ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	// opts := &etcd.DeleteOptions{PrevValue: instanceID}
-	// _, err := kvc.Delete(ctx, lockfile, opts)
-	// cancel()
-	// if err != nil {
-	// 	log.Printf("singleton-runner: releasing lock failed: %s", err)
-	// }
-	// return
-}
-
-func updateLock(lease etcd.Lease, timeout time.Duration) (err error) {
-	// log.Printf("singleton-runner: trying to update lock: %s (TTL: %v, Timeout: %v)", lockfile, ttl, timeout)
-
-	// ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	// opts := &etcd.SetOptions{PrevValue: instanceID, PrevExist: etcd.PrevExist, TTL: ttl, Refresh: false}
-	// _, err = kvc.Set(ctx, lockfile, instanceID, opts)
-	// cancel()
-	// return
-	return errors.New("not yet implemented")
+func releaseLock(lease etcd.Lease, id etcd.LeaseID) {
+	log.Printf("singleton-runner: trying to release lock")
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	_, err := lease.Revoke(ctx, id)
+	cancel()
+	if err != nil {
+		log.Printf("singleton-runner: releasing lock failed: %s", err)
+	}
+	return
 }
 
 func main() {
@@ -215,7 +194,7 @@ func main() {
 		log.Fatal("singleton-runner: '-name-template' is empty")
 	}
 	name := os.ExpandEnv(*flagNameTemplate)
-	lockfilePath := filepath.Join(LOCK_FILE_BASE, path.Clean("/"+name))
+	lockfilePath := LOCK_FILE_PREFIX + name
 
 	if *flagInstTemplate == "" {
 		log.Fatal("singleton-runner: '-instance-template' is empty")
@@ -223,9 +202,9 @@ func main() {
 	instanceID := os.ExpandEnv(*flagInstTemplate)
 
 	requestTimeout := time.Duration(*flagRequestTimeout) * time.Second
-	updateInterval := time.Duration(*flagUpdateInterval) * time.Second
+	//updateInterval := time.Duration(*flagUpdateInterval) * time.Second
 	gracePeriod := time.Duration(*flagGracePeriod) * time.Second
-	//killBackoff := time.Duration(*flagKillBackoff) * time.Second
+	killBackoff := time.Duration(*flagKillBackoff) * time.Second
 	ttl := int64(*flagRequestTimeout + *flagUpdateInterval + *flagGracePeriod + *flagKillBackoff)
 
 	machines := strings.Split(*flagEtcd, ",")
@@ -254,55 +233,72 @@ func main() {
 	//
 	// **** try to get the lock
 	//
-	if err = acquireLock(cli, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
+	//	leaseID, kac, err := acquireLock(cli, lockfilePath, instanceID, ttl, requestTimeout)
+	leaseID, _, err := acquireLock(cli, lockfilePath, instanceID, ttl, requestTimeout)
+	if err != nil {
 		log.Fatal("singleton-runner: unable to acquire lock: ", err)
 	}
 	log.Printf("singleton-runner: lock acquired successfully! .. starting %q", cmd)
-	// defer releaseLock(cli) // should this be done in any case?
+	// defer releaseLock(cli, leaseID) // should this be done in any case?
 
 	//
 	// **** run the child
 	//
-	signals := make(chan os.Signal)
-	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
-	exited, err := runChild(cmd, args, signals)
+	child, exited, err := runChild(cmd, args)
 	if err != nil {
-		releaseLock(cli) // remove here if we do this using the defer above
+		releaseLock(cli, leaseID) // remove here if we do this using the defer above
 		log.Fatal("singleton-runner: calling child failed:", err)
 	}
 
 	//
 	// **** update the lock - release lock if child exits
 	//
-	t := time.NewTicker(updateInterval)
+	signals := make(chan os.Signal)
+	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 Loop:
 	for {
 		select {
-		case <-t.C:
-			if err := updateLock(cli, requestTimeout); err != nil {
-				log.Println("singleton-runner: updateting lock failed:", err)
-				log.Println("singleton-runner: sending child the TERM signal")
-				signals <- syscall.SIGTERM
-				break Loop
-			}
+		// case resp, ok := <-kac:
+		// 	if !ok {
+		// 		log.Println("singleton-runner: keep alive reponse channel is closed!")
+		//		child.Process.Signal(syscall.SIGKILL)
+		// 		signals <- syscall.SIGTERM
+		// 		//				break Loop
+		// 	}
+		// 	log.Println("singleton-runner: got keep alive response:", resp)
+		// TODO: if TTL expired:
+		// 		signals <- syscall.SIGTERM
+		// 		break Loop
 		case <-exited:
 			log.Println("singleton-runner: closing...")
-			releaseLock(cli) // remove here if we do this using the defer above
+			releaseLock(cli, leaseID) // remove here if we do this using the defer above
 			return
+		case sig := <-signals:
+			child.Process.Signal(sig)
+			if sig == syscall.SIGTERM || sig == syscall.SIGINT {
+				log.Printf("singleton-runner: got signal %v ... waiting %v for child to terminate", sig, gracePeriod)
+				break Loop
+			}
 		}
 	}
 
 	//
 	// **** wait for child to exit - kill it after grace period
 	//
-	k := time.NewTimer(gracePeriod)
-	select {
-	case <-k.C:
-		log.Println("singleton-runner: grace period elapsed sending child the KILL signal")
-		signals <- syscall.SIGKILL
-	case <-exited:
-		log.Println("singleton-runner: exiting after child stopped")
-		releaseLock(cli) // remove here if we do this using the defer above
-		return
+	g := time.NewTimer(gracePeriod)
+	k := time.NewTimer(gracePeriod + killBackoff)
+	for {
+		select {
+		case <-g.C:
+			log.Println("singleton-runner: grace period elapsed sending child the KILL signal")
+			child.Process.Signal(syscall.SIGKILL)
+		case <-k.C:
+			log.Println("singleton-runner: child is still running ... something is very wrong!!!")
+			return
+		case <-exited:
+			log.Println("singleton-runner: releasing lock after child stopped")
+			releaseLock(cli, leaseID) // remove here if we do this using the defer above
+			return
+		}
 	}
 }
