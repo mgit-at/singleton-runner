@@ -1,16 +1,8 @@
-hash: 27bc29570757636e3067aff689f1abb025a9e1b272294c7e4e06043fe35ca0da
-updated: 2016-06-28T17:30:53.854637727+02:00
+hash: 5ea3c2fe2f83ab2c303f14cc283c0fdefcd9b864d32861458091e775bee3e12d
+updated: 2016-07-04T10:37:50.248762718+02:00
 imports:
 - name: github.com/coreos/etcd
-  version: 0cd5c658aad0372d1651f006b0739d82ca0fc20a
+  version: b566ca225cf8d6231cde375f442f3c473bb4e294
   subpackages:
-  - client
-- name: github.com/ugorji/go
-  version: b94837a2404ab90efe9289e77a70694c355739cb
-  subpackages:
-  - codec
-- name: golang.org/x/net
-  version: 04557861f124410b768b1ba5bb3a91b705afbfc6
-  subpackages:
-  - context
+  - clientv3
 devImports: []

@@ -2,10 +2,4 @@ package: github.com/mgit-at/singleton-runner
 import:
 - package: github.com/coreos/etcd
   subpackages:
-  - client
-- package: github.com/ugorji/go
-  subpackages:
-  - codec
-- package: golang.org/x/net
-  subpackages:
-  - context
+  - clientv3

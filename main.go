@@ -24,8 +24,8 @@ import (
 	"flag"
 	"io/ioutil"
 	"log"
-	"net"
-	"net/http"
+	//	"net"
+	//	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,16 +35,12 @@ import (
 	"syscall"
 	"time"
 
-	etcd "github.com/coreos/etcd/client"
-	"golang.org/x/net/context"
+	etcd "github.com/coreos/etcd/clientv3"
+	//	"golang.org/x/net/context"
 )
 
 const (
 	LOCK_FILE_BASE = "/singleton.mgit.at"
-)
-
-var (
-// Machines contains a list of all etcd machines (http address)
 )
 
 // command line flags
@@ -94,7 +90,7 @@ func runChild(cmd string, args []string, signals <-chan os.Signal) (exited chan 
 	return
 }
 
-func initETCdClient(machines []string, CA, cert, key string, timeout time.Duration) (etcd.KeysAPI, error) {
+func initETCdClient(machines []string, CA, cert, key string, timeout time.Duration) (etcd.KV, error) {
 	var tlsConfig *tls.Config
 	if cert != "" && key != "" && CA != "" {
 		cert, err := tls.LoadX509KeyPair(cert, key)
@@ -115,97 +111,91 @@ func initETCdClient(machines []string, CA, cert, key string, timeout time.Durati
 	}
 
 	cfg := etcd.Config{
-		Endpoints: machines,
-		Transport: &http.Transport{
-			Proxy:           http.ProxyFromEnvironment,
-			TLSClientConfig: tlsConfig,
-			Dial: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).Dial,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
-		HeaderTimeoutPerRequest: 5 * time.Second,
+		Endpoints:   machines,
+		TLS:         tlsConfig,
+		DialTimeout: timeout,
 	}
 
 	c, err := etcd.New(cfg)
 	if err != nil {
 		return nil, err
 	}
-	kapi := etcd.NewKeysAPI(c)
-	return kapi, err
+	kvc := etcd.NewKV(c)
+	return kvc, err
 }
 
-func IsKeyExists(err error) bool {
-	if cErr, ok := err.(etcd.Error); ok {
-		return cErr.Code == etcd.ErrorCodeNodeExist
-	}
-	return false
+// func IsKeyExists(err error) bool {
+// 	if cErr, ok := err.(etcd.Error); ok {
+// 		return cErr.Code == etcd.ErrorCodeNodeExist
+// 	}
+// 	return false
+// }
+
+func acquireLock(kvc etcd.KV, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
+	// for {
+	// 	log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
+
+	// 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// 	opts := &etcd.SetOptions{PrevExist: etcd.PrevNoExist, TTL: ttl, Refresh: false}
+	// 	_, err = kvc.Set(ctx, lockfile, instanceID, opts)
+	// 	cancel()
+	// 	if err == nil {
+	// 		return // we got the lock!
+	// 	}
+	// 	if !IsKeyExists(err) {
+	// 		return // this seems to be a severe problem.. better give up
+	// 	}
+	// 	log.Printf("singleton-runner: lock is already acquired - watching for changes")
+
+	// 	ctx, cancel = context.WithTimeout(context.Background(), ttl)
+	// 	watcher := kvc.Watcher(lockfile, nil)
+	// WatchLock:
+	// 	for {
+	// 		resp, err := watcher.Next(ctx)
+	// 		if err != nil {
+	// 			log.Printf("singleton-runner: watching for events failed: %v", err)
+	// 			return err
+	// 		}
+	// 		switch resp.Action {
+	// 		case "expire":
+	// 			fallthrough
+	// 		case "compareAndDelete":
+	// 			fallthrough
+	// 		case "delete":
+	// 			log.Printf("singleton-runner: delete or expire event - try again!")
+	// 			break WatchLock
+	// 		case "compareAndSwap":
+	// 			return errors.New("locked instance seems to be alive - giving up")
+	// 		default:
+	// 			log.Printf("singleton-runner: ignoring unknown event '%s'", resp.Action)
+	// 		}
+	// 	}
+	// }
+	// return
+	return errors.New("not yet implemented")
 }
 
-func acquireLock(kapi etcd.KeysAPI, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
-	for {
-		log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
-
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		opts := &etcd.SetOptions{PrevExist: etcd.PrevNoExist, TTL: ttl, Refresh: false}
-		_, err = kapi.Set(ctx, lockfile, instanceID, opts)
-		cancel()
-		if err == nil {
-			return // we got the lock!
-		}
-		if !IsKeyExists(err) {
-			return // this seems to be a severe problem.. better give up
-		}
-		log.Printf("singleton-runner: lock is already acquired - watching for changes")
-
-		ctx, cancel = context.WithTimeout(context.Background(), ttl)
-		watcher := kapi.Watcher(lockfile, nil)
-	WatchLock:
-		for {
-			resp, err := watcher.Next(ctx)
-			if err != nil {
-				log.Printf("singleton-runner: watching for events failed: %v", err)
-				return err
-			}
-			switch resp.Action {
-			case "expire":
-				fallthrough
-			case "compareAndDelete":
-				fallthrough
-			case "delete":
-				log.Printf("singleton-runner: delete or expire event - try again!")
-				break WatchLock
-			case "compareAndSwap":
-				return errors.New("locked instance seems to be alive - giving up")
-			default:
-				log.Printf("singleton-runner: ignoring unknown event '%s'", resp.Action)
-			}
-		}
-	}
-	return
+func releaseLock(kvc etcd.KV, lockfile, instanceID string) {
+	// log.Printf("singleton-runner: trying to release lock: %s", lockfile)
+	// ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	// opts := &etcd.DeleteOptions{PrevValue: instanceID}
+	// _, err := kvc.Delete(ctx, lockfile, opts)
+	// cancel()
+	// if err != nil {
+	// 	log.Printf("singleton-runner: releasing lock failed: %s", err)
+	// }
+	// return
 }
 
-func releaseLock(kapi etcd.KeysAPI, lockfile, instanceID string) {
-	log.Printf("singleton-runner: trying to release lock: %s", lockfile)
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	opts := &etcd.DeleteOptions{PrevValue: instanceID}
-	_, err := kapi.Delete(ctx, lockfile, opts)
-	cancel()
-	if err != nil {
-		log.Printf("singleton-runner: releasing lock failed: %s", err)
-	}
-	return
-}
+func updateLock(kvc etcd.KV, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
+	// log.Printf("singleton-runner: trying to update lock: %s (TTL: %v, Timeout: %v)", lockfile, ttl, timeout)
 
-func updateLock(kapi etcd.KeysAPI, lockfile, instanceID string, ttl, timeout time.Duration) (err error) {
-	log.Printf("singleton-runner: trying to update lock: %s (TTL: %v, Timeout: %v)", lockfile, ttl, timeout)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	opts := &etcd.SetOptions{PrevValue: instanceID, PrevExist: etcd.PrevExist, TTL: ttl, Refresh: false}
-	_, err = kapi.Set(ctx, lockfile, instanceID, opts)
-	cancel()
-	return
+	// ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// opts := &etcd.SetOptions{PrevValue: instanceID, PrevExist: etcd.PrevExist, TTL: ttl, Refresh: false}
+	// _, err = kvc.Set(ctx, lockfile, instanceID, opts)
+	// cancel()
+	// return
+	return errors.New("not yet implemented")
 }
 
 func main() {
@@ -248,16 +238,16 @@ func main() {
 	// **** initialization
 	//
 
-	kapi, err := initETCdClient(machines, CA, cert, key, requestTimeout)
+	kvc, err := initETCdClient(machines, CA, cert, key, requestTimeout)
 	if err != nil {
 		log.Fatal("error connecting to etcd:", err)
 	}
-	// defer releaseLock(kapi, lockfilePath, instanceID) // should this be done in any case?
+	// defer releaseLock(kvc, lockfilePath, instanceID) // should this be done in any case?
 
 	//
 	// **** try to get the lock
 	//
-	if err := acquireLock(kapi, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
+	if err := acquireLock(kvc, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
 		log.Fatal("singleton-runner: unable to acquire lock: ", err)
 	}
 	log.Printf("singleton-runner: lock acquired successfully! .. starting %q", cmd)
@@ -269,7 +259,7 @@ func main() {
 	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 	exited, err := runChild(cmd, args, signals)
 	if err != nil {
-		releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
+		releaseLock(kvc, lockfilePath, instanceID) // remove here if we do this using the defer above
 		log.Fatal("singleton-runner: calling child failed:", err)
 	}
 
@@ -281,7 +271,7 @@ Loop:
 	for {
 		select {
 		case <-t.C:
-			if err := updateLock(kapi, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
+			if err := updateLock(kvc, lockfilePath, instanceID, ttl, requestTimeout); err != nil {
 				log.Println("singleton-runner: updateting lock failed:", err)
 				log.Println("singleton-runner: sending child the TERM signal")
 				signals <- syscall.SIGTERM
@@ -289,7 +279,7 @@ Loop:
 			}
 		case <-exited:
 			log.Println("singleton-runner: closing...")
-			releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
+			releaseLock(kvc, lockfilePath, instanceID) // remove here if we do this using the defer above
 			return
 		}
 	}
@@ -304,7 +294,7 @@ Loop:
 		signals <- syscall.SIGKILL
 	case <-exited:
 		log.Println("singleton-runner: exiting after child stopped")
-		releaseLock(kapi, lockfilePath, instanceID) // remove here if we do this using the defer above
+		releaseLock(kvc, lockfilePath, instanceID) // remove here if we do this using the defer above
 		return
 	}
 }
