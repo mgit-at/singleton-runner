@@ -24,8 +24,6 @@ import (
 	"flag"
 	"io/ioutil"
 	"log"
-	//	"net"
-	//	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -116,66 +114,54 @@ func initETCdClient(machines []string, CA, cert, key string, timeout time.Durati
 }
 
 func acquireLock(cli *etcd.Client, lockfile, instanceID string, ttl int64, timeout time.Duration) (etcd.LeaseID, <-chan *etcd.LeaseKeepAliveResponse, context.CancelFunc, error) {
-	// for {
-	log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
+AcquireLoop:
+	for {
+		log.Printf("singleton-runner: trying to acquire lock: %s (TTL: %v)", lockfile, ttl)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	resp, err := cli.Grant(ctx, ttl)
-	if err != nil {
-		return etcd.NoLease, nil, nil, err
-	}
-
-	log.Printf("singleton-runner: got lease with ID: %v", resp.ID)
-
-	respTxn, err := cli.Txn(ctx).
-		If(etcd.Compare(etcd.Version(lockfile), "=", 0)).
-		Then(etcd.OpPut(lockfile, instanceID, etcd.WithLease(resp.ID))).Commit()
-	if err != nil {
-		return etcd.NoLease, nil, nil, err
-	}
-	if respTxn.Succeeded {
-		ctx, cancel := context.WithCancel(context.Background())
-		ch, err := cli.KeepAlive(ctx, resp.ID)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		resp, err := cli.Grant(ctx, ttl)
 		if err != nil {
+			cancel()
 			return etcd.NoLease, nil, nil, err
 		}
 
-		return resp.ID, ch, cancel, nil
-	}
+		log.Printf("singleton-runner: got lease with ID: %v", resp.ID)
 
-	return etcd.NoLease, nil, nil, errors.New("lock already acquired .. watching is not yet implemented")
-	//  log.Printf("singleton-runner: lock is already acquired - watching for changes")
-	// 	ctx, cancel = context.WithTimeout(context.Background(), ttl)
-	// 	watcher := kvc.Watcher(lockfile, nil)
-	// WatchLock:
-	// 	for {
-	// 		resp, err := watcher.Next(ctx)
-	// 		if err != nil {
-	// 			log.Printf("singleton-runner: watching for events failed: %v", err)
-	// 			return err
-	// 		}
-	// 		switch resp.Action {
-	// 		case "expire":
-	// 			fallthrough
-	// 		case "compareAndDelete":
-	// 			fallthrough
-	// 		case "delete":
-	// 			log.Printf("singleton-runner: delete or expire event - try again!")
-	// 			break WatchLock
-	// 		case "compareAndSwap":
-	// 			return errors.New("locked instance seems to be alive - giving up")
-	// 		default:
-	// 			log.Printf("singleton-runner: ignoring unknown event '%s'", resp.Action)
-	// 		}
-	// 	}
-	// }
-	// return
+		respTxn, err := cli.Txn(ctx).
+			If(etcd.Compare(etcd.Version(lockfile), "=", 0)).
+			Then(etcd.OpPut(lockfile, instanceID, etcd.WithLease(resp.ID))).Commit()
+		cancel()
+		if err != nil {
+			return etcd.NoLease, nil, nil, err
+		}
+		if respTxn.Succeeded {
+			ctxKA, cancelKA := context.WithCancel(context.Background())
+			ch, err := cli.KeepAlive(ctxKA, resp.ID)
+			if err != nil {
+				return etcd.NoLease, nil, nil, err
+			}
+			return resp.ID, ch, cancelKA, nil
+		}
+
+		log.Printf("singleton-runner: lock is already acquired - watching for changes")
+		ctxWatch, cancelWatch := context.WithTimeout(context.Background(), 3*time.Duration(ttl)*time.Second) // TODO: how long should we wait for this?
+		watch := cli.Watch(ctxWatch, lockfile)
+		for resp := range watch {
+			if len(resp.Events) > 0 {
+				lastEvent := resp.Events[len(resp.Events)-1]
+				if lastEvent.Type == etcd.EventTypeDelete {
+					log.Printf("singleton-runner: lock just got deleted...")
+					cancelWatch()
+					continue AcquireLoop
+				}
+			}
+		}
+		cancelWatch()
+		return etcd.NoLease, nil, nil, errors.New("watching for events failed/timed-out")
+	}
 }
 
 func releaseLock(lease etcd.Lease, id etcd.LeaseID, ttl int64) {
-	log.Printf("singleton-runner: trying to release lock")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(ttl)*time.Second)
 	_, err := lease.Revoke(ctx, id)
 	cancel()
@@ -244,6 +230,9 @@ func main() {
 	//
 	// **** run the child
 	//
+	signals := make(chan os.Signal)
+	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
+
 	child, exited, err := runChild(cmd, args)
 	if err != nil {
 		log.Fatal("singleton-runner: calling child failed:", err)
@@ -252,9 +241,6 @@ func main() {
 	//
 	// **** update the lock - release lock if child exits
 	//
-	signals := make(chan os.Signal)
-	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
-
 Loop:
 	for {
 		select {
