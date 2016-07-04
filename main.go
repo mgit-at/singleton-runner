@@ -44,8 +44,7 @@ var (
 	flagNameTemplate   = flag.String("name-template", "", "template for the lockfile name (will get expanded using environment variables)")
 	flagInstTemplate   = flag.String("instance-template", "", "template for the instance name (will get expanded using environment variables)")
 	flagRequestTimeout = flag.Uint("request-timeout", 5, "timeout in seconds to wait for responses from etcd")
-	flagUpdateInterval = flag.Uint("update-interval", 30, "interval in seconds between lock file update requests")
-	flagGracePeriod    = flag.Uint("grace-period", 30, "time in seconds to wait for a normal shutdown of the child")
+	flagGracePeriod    = flag.Uint("grace-period", 25, "time in seconds to wait for a normal shutdown of the child")
 	flagKillBackoff    = flag.Uint("kill-backoff", 5, "")
 	flagEtcd           = flag.String("etcd", "http://127.0.0.1:2379", "etcd machines (comma separated list)")
 	flagCA             = flag.String("ca", "", "CA certificate")
@@ -189,10 +188,15 @@ func main() {
 	instanceID := os.ExpandEnv(*flagInstTemplate)
 
 	requestTimeout := time.Duration(*flagRequestTimeout) * time.Second
-	//updateInterval := time.Duration(*flagUpdateInterval) * time.Second
 	gracePeriod := time.Duration(*flagGracePeriod) * time.Second
 	killBackoff := time.Duration(*flagKillBackoff) * time.Second
-	ttl := int64(*flagRequestTimeout + *flagUpdateInterval + *flagGracePeriod + *flagKillBackoff)
+	// etcd library sends keep alives after ttl/3 seconds ...
+	// to make sure we have enough time to cleanup:
+	//
+	//     ttl = rt + ttl/3 + gp + kb   --->   ttl = 3/2 * (rt + gp + kb)
+	//
+	//   add 1 second because these are integers and we want to round up in any case
+	ttl := int64((3*(*flagRequestTimeout+*flagGracePeriod+*flagKillBackoff))/2) + 1
 
 	machines := strings.Split(*flagEtcd, ",")
 	CA := *flagCA
@@ -244,17 +248,16 @@ func main() {
 Loop:
 	for {
 		select {
-		case resp, ok := <-kaCh:
+		//case resp, ok := <-kaCh:
+		case _, ok := <-kaCh:
 			if !ok {
 				log.Println("singleton-runner: keep alive reponse channel is closed - sending child the TERM signal")
 				child.Process.Signal(syscall.SIGTERM)
 				break Loop
-			} else {
-				log.Printf("singleton-runner: got keep alive response: %v", time.Duration(resp.TTL)*time.Second)
-				// TODO: if TTL expired:
-				// 	  child.Process.Signal(syscall.SIGTERM)
-				// 		break Loop
 			}
+			// else {
+			// 	log.Printf("singleton-runner: got keep alive response: %v", time.Duration(resp.TTL)*time.Second)
+			// }
 		case <-exited:
 			log.Println("singleton-runner: closing...")
 			kaCancel()
@@ -281,9 +284,11 @@ Loop:
 			child.Process.Signal(syscall.SIGKILL)
 		case <-k.C:
 			log.Println("singleton-runner: child is still running ... something is very wrong!!!")
+			signal.Reset()
 			return
 		case <-exited:
 			log.Println("singleton-runner: releasing lock after child stopped")
+			signal.Reset()
 			return
 		}
 	}
