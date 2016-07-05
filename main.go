@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -41,8 +42,8 @@ const (
 
 // command line flags
 var (
-	flagNameTemplate   = flag.String("name-template", "", "template for the lockfile name (will get expanded using environment variables)")
-	flagInstTemplate   = flag.String("instance-template", "", "template for the instance name (will get expanded using environment variables)")
+	flagNameTemplate   = flag.String("name-template", "", "template for the lockfile name")
+	flagInstTemplate   = flag.String("instance-template", "", "template for the instance name")
 	flagRequestTimeout = flag.Uint("request-timeout", 5, "timeout in seconds to wait for responses from etcd")
 	flagGracePeriod    = flag.Uint("grace-period", 25, "time in seconds to wait for a normal shutdown of the child")
 	flagKillBackoff    = flag.Uint("kill-backoff", 5, "")
@@ -51,6 +52,26 @@ var (
 	flagCert           = flag.String("cert", "", "client certificate")
 	flagKey            = flag.String("key", "", "client key")
 )
+
+type ExpandedValue struct {
+	flag.Value
+}
+
+func (v *ExpandedValue) Set(str string) error {
+	return v.Value.Set(os.ExpandEnv(str))
+}
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\n all arguments will get expanded using environment variables\n")
+	}
+	flag.VisitAll(func(f *flag.Flag) {
+		f.Value = &ExpandedValue{f.Value}
+	})
+	flag.Parse()
+}
 
 func runChild(cmd string, args []string) (child exec.Cmd, exited chan bool, err error) {
 	child.Path = cmd
@@ -174,18 +195,15 @@ func main() {
 	//
 	// **** parse command line
 	//
-	flag.Parse()
-
 	if *flagNameTemplate == "" {
 		log.Fatal("singleton-runner: '-name-template' is empty")
 	}
-	name := os.ExpandEnv(*flagNameTemplate)
-	lockfilePath := LOCK_FILE_PREFIX + name
+	lockfilePath := LOCK_FILE_PREFIX + *flagNameTemplate
 
 	if *flagInstTemplate == "" {
 		log.Fatal("singleton-runner: '-instance-template' is empty")
 	}
-	instanceID := os.ExpandEnv(*flagInstTemplate)
+	instanceID := *flagInstTemplate
 
 	requestTimeout := time.Duration(*flagRequestTimeout) * time.Second
 	gracePeriod := time.Duration(*flagGracePeriod) * time.Second
