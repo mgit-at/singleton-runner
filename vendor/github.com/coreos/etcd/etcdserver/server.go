@@ -153,13 +153,14 @@ type Server interface {
 
 // EtcdServer is the production implementation of the Server interface
 type EtcdServer struct {
-	// r and inflightSnapshots must be the first elements to keep 64-bit alignment for atomic
-	// access to fields
-
-	// count the number of inflight snapshots.
-	// MUST use atomic operation to access this field.
-	inflightSnapshots int64
-	Cfg               *ServerConfig
+	// inflightSnapshots holds count the number of snapshots currently inflight.
+	inflightSnapshots int64  // must use atomic operations to access; keep 64-bit aligned.
+	appliedIndex      uint64 // must use atomic operations to access; keep 64-bit aligned.
+	committedIndex    uint64 // must use atomic operations to access; keep 64-bit aligned.
+	// consistIndex used to hold the offset of current executing entry
+	// It is initialized to 0 before executing any entry.
+	consistIndex consistentIndex // must use atomic operations to access; keep 64-bit aligned.
+	Cfg          *ServerConfig
 
 	readych chan struct{}
 	r       raftNode
@@ -194,10 +195,6 @@ type EtcdServer struct {
 	// compactor is used to auto-compact the KV.
 	compactor *compactor.Periodic
 
-	// consistent index used to hold the offset of current executing entry
-	// It is initialized to 0 before executing any entry.
-	consistIndex consistentIndex
-
 	// peerRt used to send requests (version, lease) to peers.
 	peerRt   http.RoundTripper
 	reqIDGen *idutil.Generator
@@ -211,8 +208,6 @@ type EtcdServer struct {
 	// wg is used to wait for the go routines that depends on the server state
 	// to exit when stopping the server.
 	wg sync.WaitGroup
-
-	appliedIndex uint64
 }
 
 // NewServer creates a new EtcdServer from the supplied configuration. The
@@ -230,15 +225,6 @@ func NewServer(cfg *ServerConfig) (srv *EtcdServer, err error) {
 
 	if terr := fileutil.TouchDirAll(cfg.DataDir); terr != nil {
 		return nil, fmt.Errorf("cannot access data directory: %v", terr)
-	}
-
-	// Run the migrations.
-	dataVer, err := version.DetectDataDir(cfg.DataDir)
-	if err != nil {
-		return nil, err
-	}
-	if err = upgradeDataDir(cfg.DataDir, cfg.Name, dataVer); err != nil {
-		return nil, err
 	}
 
 	haveWAL := wal.Exist(cfg.WALDir())
@@ -589,6 +575,16 @@ func (s *EtcdServer) run() {
 	for {
 		select {
 		case ap := <-s.r.apply():
+			var ci uint64
+			if len(ap.entries) != 0 {
+				ci = ap.entries[len(ap.entries)-1].Index
+			}
+			if ap.snapshot.Metadata.Index > ci {
+				ci = ap.snapshot.Metadata.Index
+			}
+			if ci != 0 {
+				s.setCommittedIndex(ci)
+			}
 			f := func(context.Context) { s.applyAll(&ep, &ap) }
 			sched.Schedule(f)
 		case leases := <-expiredLeaseC:
@@ -1048,6 +1044,7 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 		s.consistIndex.setConsistentIndex(e.Index)
 		shouldApplyV3 = true
 	}
+	defer s.setAppliedIndex(e.Index)
 
 	// raft state machine may generate noop entry when leader confirmation.
 	// skip it in advance to avoid some potential bug in the future
@@ -1082,8 +1079,15 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 		id = raftReq.Header.ID
 	}
 
-	ar := s.applyV3.Apply(&raftReq)
-	s.setAppliedIndex(e.Index)
+	var ar *applyResult
+	if s.w.IsRegistered(id) || !noSideEffect(&raftReq) {
+		ar = s.applyV3.Apply(&raftReq)
+	}
+
+	if ar == nil {
+		return
+	}
+
 	if ar.err != ErrNoSpace || len(s.alarmStore.Get(pb.AlarmType_NOSPACE)) > 0 {
 		s.w.Trigger(id, ar)
 		return
@@ -1348,4 +1352,12 @@ func (s *EtcdServer) getAppliedIndex() uint64 {
 
 func (s *EtcdServer) setAppliedIndex(v uint64) {
 	atomic.StoreUint64(&s.appliedIndex, v)
+}
+
+func (s *EtcdServer) getCommittedIndex() uint64 {
+	return atomic.LoadUint64(&s.committedIndex)
+}
+
+func (s *EtcdServer) setCommittedIndex(v uint64) {
+	atomic.StoreUint64(&s.committedIndex, v)
 }

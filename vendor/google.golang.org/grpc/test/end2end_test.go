@@ -550,7 +550,7 @@ func testTimeoutOnDeadServer(t *testing.T, e env) {
 
 	cc := te.clientConn()
 	tc := testpb.NewTestServiceClient(cc)
-	if _, err := tc.EmptyCall(context.Background(), &testpb.Empty{}); err != nil {
+	if _, err := tc.EmptyCall(context.Background(), &testpb.Empty{}, grpc.FailFast(false)); err != nil {
 		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want _, <nil>", err)
 	}
 	te.srv.Stop()
@@ -558,9 +558,53 @@ func testTimeoutOnDeadServer(t *testing.T, e env) {
 	// notification in time the failure path of the 1st invoke of
 	// ClientConn.wait hits the deadline exceeded error.
 	ctx, _ := context.WithTimeout(context.Background(), -1)
-	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); grpc.Code(err) != codes.DeadlineExceeded {
+	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}, grpc.FailFast(false)); grpc.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("TestService/EmptyCall(%v, _) = _, %v, want _, error code: %d", ctx, err, codes.DeadlineExceeded)
 	}
+	awaitNewConnLogOutput()
+}
+
+func TestFailFast(t *testing.T) {
+	defer leakCheck(t)()
+	for _, e := range listTestEnv() {
+		testFailFast(t, e)
+	}
+}
+
+func testFailFast(t *testing.T, e env) {
+	te := newTest(t, e)
+	te.userAgent = testAppUA
+	te.declareLogNoise(
+		"transport: http2Client.notifyError got notified that the client transport was broken EOF",
+		"grpc: Conn.transportMonitor exits due to: grpc: the client connection is closing",
+		"grpc: Conn.resetTransport failed to create client transport: connection error",
+		"grpc: Conn.resetTransport failed to create client transport: connection error: desc = \"transport: dial unix",
+	)
+	te.startServer()
+	defer te.tearDown()
+
+	cc := te.clientConn()
+	tc := testpb.NewTestServiceClient(cc)
+	if _, err := tc.EmptyCall(context.Background(), &testpb.Empty{}); err != nil {
+		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want _, <nil>", err)
+	}
+	// Stop the server and tear down all the exisiting connections.
+	te.srv.Stop()
+	// Loop until the server teardown is propagated to the client.
+	for {
+		if _, err := tc.EmptyCall(context.Background(), &testpb.Empty{}); grpc.Code(err) == codes.Unavailable {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The client keeps reconnecting and ongoing fail-fast RPCs should fail with code.Unavailable.
+	if _, err := tc.EmptyCall(context.Background(), &testpb.Empty{}); grpc.Code(err) != codes.Unavailable {
+		t.Fatalf("TestService/EmptyCall(_, _, _) = _, %v, want _, error code: %d", err, codes.Unavailable)
+	}
+	if _, err := tc.StreamingInputCall(context.Background()); grpc.Code(err) != codes.Unavailable {
+		t.Fatalf("TestService/StreamingInputCall(_) = _, %v, want _, error code: %d", err, codes.Unavailable)
+	}
+
 	awaitNewConnLogOutput()
 }
 
@@ -615,7 +659,8 @@ func testHealthCheckOnFailure(t *testing.T, e env) {
 	defer te.tearDown()
 
 	cc := te.clientConn()
-	if _, err := healthCheck(0*time.Second, cc, "grpc.health.v1.Health"); err != grpc.Errorf(codes.DeadlineExceeded, "context deadline exceeded") {
+	wantErr := grpc.Errorf(codes.DeadlineExceeded, "context deadline exceeded")
+	if _, err := healthCheck(0*time.Second, cc, "grpc.health.v1.Health"); !equalErrors(err, wantErr) {
 		t.Fatalf("Health/Check(_, _) = _, %v, want _, error code %d", err, codes.DeadlineExceeded)
 	}
 	awaitNewConnLogOutput()
@@ -637,7 +682,7 @@ func testHealthCheckOff(t *testing.T, e env) {
 	te.startServer()
 	defer te.tearDown()
 	want := grpc.Errorf(codes.Unimplemented, "unknown service grpc.health.v1.Health")
-	if _, err := healthCheck(1*time.Second, te.clientConn(), ""); err != want {
+	if _, err := healthCheck(1*time.Second, te.clientConn(), ""); !equalErrors(err, want) {
 		t.Fatalf("Health/Check(_, _) = _, %v, want _, %v", err, want)
 	}
 }
@@ -664,7 +709,8 @@ func testHealthCheckServingStatus(t *testing.T, e env) {
 	if out.Status != healthpb.HealthCheckResponse_SERVING {
 		t.Fatalf("Got the serving status %v, want SERVING", out.Status)
 	}
-	if _, err := healthCheck(1*time.Second, cc, "grpc.health.v1.Health"); err != grpc.Errorf(codes.NotFound, "unknown service") {
+	wantErr := grpc.Errorf(codes.NotFound, "unknown service")
+	if _, err := healthCheck(1*time.Second, cc, "grpc.health.v1.Health"); !equalErrors(err, wantErr) {
 		t.Fatalf("Health/Check(_, _) = _, %v, want _, error code %d", err, codes.NotFound)
 	}
 	hs.SetServingStatus("grpc.health.v1.Health", healthpb.HealthCheckResponse_SERVING)
@@ -746,7 +792,7 @@ func testFailedEmptyUnary(t *testing.T, e env) {
 
 	ctx := metadata.NewContext(context.Background(), testMetadata)
 	wantErr := grpc.Errorf(codes.DataLoss, "missing expected user-agent")
-	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); err != wantErr {
+	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); !equalErrors(err, wantErr) {
 		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want _, %v", err, wantErr)
 	}
 }
@@ -879,7 +925,7 @@ func performOneRPC(t *testing.T, tc testpb.TestServiceClient, wg *sync.WaitGroup
 		ResponseSize: proto.Int32(respSize),
 		Payload:      payload,
 	}
-	reply, err := tc.UnaryCall(context.Background(), req)
+	reply, err := tc.UnaryCall(context.Background(), req, grpc.FailFast(false))
 	if err != nil {
 		t.Errorf("TestService/UnaryCall(_, _) = _, %v, want _, <nil>", err)
 		return
@@ -1106,9 +1152,7 @@ func testNoService(t *testing.T, e env) {
 	cc := te.clientConn()
 	tc := testpb.NewTestServiceClient(cc)
 
-	// Make sure setting ack has been sent.
-	time.Sleep(20 * time.Millisecond)
-	stream, err := tc.FullDuplexCall(te.ctx)
+	stream, err := tc.FullDuplexCall(te.ctx, grpc.FailFast(false))
 	if err != nil {
 		t.Fatalf("%v.FullDuplexCall(_) = _, %v, want <nil>", tc, err)
 	}
@@ -1331,8 +1375,9 @@ func testFailedServerStreaming(t *testing.T, e env) {
 	if err != nil {
 		t.Fatalf("%v.StreamingOutputCall(_) = _, %v, want <nil>", tc, err)
 	}
-	if _, err := stream.Recv(); err != grpc.Errorf(codes.DataLoss, "got extra metadata") {
-		t.Fatalf("%v.Recv() = _, %v, want _, %v", stream, err, grpc.Errorf(codes.DataLoss, "got extra metadata"))
+	wantErr := grpc.Errorf(codes.DataLoss, "got extra metadata")
+	if _, err := stream.Recv(); !equalErrors(err, wantErr) {
+		t.Fatalf("%v.Recv() = _, %v, want _, %v", stream, err, wantErr)
 	}
 }
 
@@ -2081,4 +2126,8 @@ func (fw *filterWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 	return fw.dst.Write(p)
+}
+
+func equalErrors(l, r error) bool {
+	return grpc.Code(l) == grpc.Code(r) && grpc.ErrorDesc(l) == grpc.ErrorDesc(r)
 }

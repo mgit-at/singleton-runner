@@ -25,6 +25,7 @@ import (
 
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/tools/functional-tester/etcd-agent/client"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -36,6 +37,7 @@ type cluster struct {
 	v2Only bool // to be deprecated
 
 	datadir              string
+	stressQPS            int
 	stressKeySize        int
 	stressKeySuffixRange int
 
@@ -50,10 +52,11 @@ type ClusterStatus struct {
 }
 
 // newCluster starts and returns a new cluster. The caller should call Terminate when finished, to shut it down.
-func newCluster(agentEndpoints []string, datadir string, stressKeySize, stressKeySuffixRange int, isV2Only bool) (*cluster, error) {
+func newCluster(agentEndpoints []string, datadir string, stressQPS, stressKeySize, stressKeySuffixRange int, isV2Only bool) (*cluster, error) {
 	c := &cluster{
 		v2Only:               isV2Only,
 		datadir:              datadir,
+		stressQPS:            stressQPS,
 		stressKeySize:        stressKeySize,
 		stressKeySuffixRange: stressKeySuffixRange,
 	}
@@ -123,6 +126,7 @@ func (c *cluster) bootstrap(agentEndpoints []string) error {
 				Endpoint:       m.grpcAddr(),
 				KeySize:        c.stressKeySize,
 				KeySuffixRange: c.stressKeySuffixRange,
+				qps:            c.stressQPS,
 				N:              stressN,
 			}
 		}
@@ -260,7 +264,7 @@ func (c *cluster) compactKV(rev int64, timeout time.Duration) (err error) {
 		kvc := pb.NewKVClient(conn)
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		plog.Printf("[compact kv #%d] starting (endpoint %s)", i, u)
-		_, cerr := kvc.Compact(ctx, &pb.CompactionRequest{Revision: rev, Physical: true})
+		_, cerr := kvc.Compact(ctx, &pb.CompactionRequest{Revision: rev, Physical: true}, grpc.FailFast(false))
 		cancel()
 		conn.Close()
 		succeed := true
