@@ -16,6 +16,7 @@ package integration
 
 import (
 	"bytes"
+	"math/rand"
 	"reflect"
 	"strings"
 	"testing"
@@ -647,18 +648,121 @@ func TestKVGetCancel(t *testing.T) {
 	}
 }
 
-// TestKVPutStoppedServerAndClose ensures closing after a failed Put works.
-func TestKVPutStoppedServerAndClose(t *testing.T) {
+// TestKVGetStoppedServerAndClose ensures closing after a failed Get works.
+func TestKVGetStoppedServerAndClose(t *testing.T) {
 	defer testutil.AfterTest(t)
+
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
+
 	cli := clus.Client(0)
 	clus.Members[0].Stop(t)
 	ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
-	// this Put fails and triggers an asynchronous connection retry
-	_, err := cli.Put(ctx, "abc", "123")
+	// this Get fails and triggers an asynchronous connection retry
+	_, err := cli.Get(ctx, "abc")
 	cancel()
 	if !strings.Contains(err.Error(), "context deadline") {
 		t.Fatal(err)
+	}
+}
+
+// TestKVPutStoppedServerAndClose ensures closing after a failed Put works.
+func TestKVPutStoppedServerAndClose(t *testing.T) {
+	defer testutil.AfterTest(t)
+
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	cli := clus.Client(0)
+	clus.Members[0].Stop(t)
+
+	ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+	// get retries on all errors.
+	// so here we use it to eat the potential broken pipe error for the next put.
+	// grpc client might see a broken pipe error when we issue the get request before
+	// grpc finds out the original connection is down due to the member shutdown.
+	_, err := cli.Get(ctx, "abc")
+	cancel()
+	if !strings.Contains(err.Error(), "context deadline") {
+		t.Fatal(err)
+	}
+
+	// this Put fails and triggers an asynchronous connection retry
+	_, err = cli.Put(ctx, "abc", "123")
+	cancel()
+	if !strings.Contains(err.Error(), "context deadline") {
+		t.Fatal(err)
+	}
+}
+
+// TestKVGetOneEndpointDown ensures a client can connect and get if one endpoint is down
+func TestKVPutOneEndpointDown(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	defer clus.Terminate(t)
+
+	// get endpoint list
+	eps := make([]string, 3)
+	for i := range eps {
+		eps[i] = clus.Members[i].GRPCAddr()
+	}
+
+	// make a dead node
+	clus.Members[rand.Intn(len(eps))].Stop(t)
+
+	// try to connect with dead node in the endpoint list
+	cfg := clientv3.Config{Endpoints: eps, DialTimeout: 1 * time.Second}
+	cli, err := clientv3.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.TODO(), 3*time.Second)
+	if _, err := cli.Get(ctx, "abc", clientv3.WithSerializable()); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+}
+
+// TestKVGetResetLoneEndpoint ensures that if an endpoint resets and all other
+// endpoints are down, then it will reconnect.
+func TestKVGetResetLoneEndpoint(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 2})
+	defer clus.Terminate(t)
+
+	// get endpoint list
+	eps := make([]string, 2)
+	for i := range eps {
+		eps[i] = clus.Members[i].GRPCAddr()
+	}
+
+	cfg := clientv3.Config{Endpoints: eps, DialTimeout: 500 * time.Millisecond}
+	cli, err := clientv3.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	// disconnect everything
+	clus.Members[0].Stop(t)
+	clus.Members[1].Stop(t)
+
+	// have Get try to reconnect
+	donec := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
+		if _, err := cli.Get(ctx, "abc", clientv3.WithSerializable()); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		close(donec)
+	}()
+	time.Sleep(500 * time.Millisecond)
+	clus.Members[0].Restart(t)
+	select {
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for Get")
+	case <-donec:
 	}
 }

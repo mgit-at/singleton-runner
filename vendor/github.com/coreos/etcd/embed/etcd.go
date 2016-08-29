@@ -116,6 +116,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		QuotaBackendBytes:       cfg.QuotaBackendBytes,
 		StrictReconfigCheck:     cfg.StrictReconfigCheck,
 		EnablePprof:             cfg.EnablePprof,
+		ClientCertAuthEnabled:   cfg.ClientTLSInfo.ClientCertAuth,
 	}
 
 	if e.Server, err = etcdserver.NewServer(srvcfg); err != nil {
@@ -126,7 +127,9 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 	e.errc = make(chan error, len(e.Peers)+len(e.Clients)+2*len(e.sctxs))
 
 	e.Server.Start()
-	e.serve()
+	if err = e.serve(); err != nil {
+		return
+	}
 	<-e.Server.ReadyNotify()
 	return
 }
@@ -225,7 +228,7 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 	for _, u := range cfg.LCUrls {
 		sctx := newServeCtx()
 
-		if u.Scheme == "http" {
+		if u.Scheme == "http" || u.Scheme == "unix" {
 			if !cfg.ClientTLSInfo.Empty() {
 				plog.Warningf("The scheme of client url %s is HTTP while peer key/cert files are presented. Ignored key/cert files.", u.String())
 			}
@@ -233,11 +236,16 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 				plog.Warningf("The scheme of client url %s is HTTP while client cert auth (--client-cert-auth) is enabled. Ignored client cert auth for this url.", u.String())
 			}
 		}
-		if u.Scheme == "https" && cfg.ClientTLSInfo.Empty() {
+		if (u.Scheme == "https" || u.Scheme == "unixs") && cfg.ClientTLSInfo.Empty() {
 			return nil, fmt.Errorf("TLS key/cert (--cert-file, --key-file) must be provided for client url %s with HTTPs scheme", u.String())
 		}
 
-		sctx.secure = u.Scheme == "https"
+		proto := "tcp"
+		if u.Scheme == "unix" || u.Scheme == "unixs" {
+			proto = "unix"
+		}
+
+		sctx.secure = u.Scheme == "https" || u.Scheme == "unixs"
 		sctx.insecure = !sctx.secure
 		if oldctx := sctxs[u.Host]; oldctx != nil {
 			oldctx.secure = oldctx.secure || sctx.secure
@@ -245,7 +253,7 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 			continue
 		}
 
-		if sctx.l, err = net.Listen("tcp", u.Host); err != nil {
+		if sctx.l, err = net.Listen(proto, u.Host); err != nil {
 			return nil, err
 		}
 
@@ -256,8 +264,10 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 			sctx.l = transport.LimitListener(sctx.l, int(fdLimit-reservedInternalFDNum))
 		}
 
-		if sctx.l, err = transport.NewKeepAliveListener(sctx.l, "tcp", nil); err != nil {
-			return nil, err
+		if proto == "tcp" {
+			if sctx.l, err = transport.NewKeepAliveListener(sctx.l, "tcp", nil); err != nil {
+				return nil, err
+			}
 		}
 
 		plog.Info("listening for client requests on ", u.Host)
@@ -267,6 +277,7 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 				plog.Info("stopping listening for client requests on ", u.Host)
 			}
 		}()
+		sctx.userHandlers = cfg.UserHandlers
 		sctxs[u.Host] = sctx
 	}
 	return sctxs, nil

@@ -17,6 +17,7 @@ package grpcproxy
 import (
 	"github.com/coreos/etcd/clientv3"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	"github.com/coreos/etcd/mvcc"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 )
 
@@ -27,7 +28,9 @@ type watchRange struct {
 type watcher struct {
 	id int64
 	wr watchRange
-	// TODO: support filter
+
+	rev      int64
+	filters  []mvcc.FilterFunc
 	progress bool
 	ch       chan<- *pb.WatchResponse
 }
@@ -37,15 +40,39 @@ func (w *watcher) send(wr clientv3.WatchResponse) {
 		return
 	}
 
-	// todo: filter out the events that this watcher already seen.
+	events := make([]*mvccpb.Event, 0, len(wr.Events))
 
-	evs := wr.Events
-	events := make([]*mvccpb.Event, len(evs))
-	for i := range evs {
-		events[i] = (*mvccpb.Event)(evs[i])
+	for i := range wr.Events {
+		ev := (*mvccpb.Event)(wr.Events[i])
+		if ev.Kv.ModRevision <= w.rev {
+			continue
+		} else {
+			w.rev = ev.Kv.ModRevision
+		}
+
+		filtered := false
+		if len(w.filters) != 0 {
+			for _, filter := range w.filters {
+				if filter(*ev) {
+					filtered = true
+					break
+				}
+			}
+		}
+
+		if !filtered {
+			events = append(events, ev)
+		}
 	}
+
+	// all events are filtered out?
+	if !wr.IsProgressNotify() && !wr.Created && len(events) == 0 {
+		return
+	}
+
 	pbwr := &pb.WatchResponse{
 		Header:  &wr.Header,
+		Created: wr.Created,
 		WatchId: w.id,
 		Events:  events,
 	}

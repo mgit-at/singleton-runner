@@ -357,6 +357,8 @@ To help clients discover the etcd cluster, the following DNS SRV records are loo
 
 If `_etcd-client-ssl._tcp.example.com` is found, clients will attempt to communicate with the etcd cluster over SSL/TLS.
 
+If etcd is using TLS without a custom certificate authority, the discovery domain (e.g., example.com) must match the SRV record domain (e.g., infra1.example.com). This is to mitigate attacks that forge SRV records to point to a different domain; the domain would have a valid certificate under PKI but be controlled by an unknown third party.
+
 #### Create DNS SRV records
 
 ```
@@ -454,6 +456,10 @@ $ etcd --name infra2 \
 --listen-peer-urls http://10.0.1.12:2380
 ```
 
+### Gateway
+
+etcd gateway is a simple TCP proxy that forwards network data to the etcd cluster. Please read [gateway guide] for more information.
+
 ### Proxy
 
 When the `--proxy` flag is set, etcd runs in [proxy mode][proxy]. This proxy mode only supports the etcd v2 API; there are no plans to support the v3 API. Instead, for v3 API support, there will be a new proxy with enhanced features following the etcd 3.0 release.
@@ -470,3 +476,4 @@ To setup an etcd cluster with proxies of v2 API, please read the the [clustering
 [clustering_etcd2]: https://github.com/coreos/etcd/blob/release-2.3/Documentation/clustering.md
 [security-guide]: security.md
 [tls-setup]: /hack/tls-setup
+[gateway]: gateway.md

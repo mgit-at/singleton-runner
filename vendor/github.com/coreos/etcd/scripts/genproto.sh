@@ -20,8 +20,8 @@ fi
 DIRS="./wal/walpb ./etcdserver/etcdserverpb ./snap/snappb ./raft/raftpb ./mvcc/mvccpb ./lease/leasepb ./auth/authpb"
 
 # exact version of protoc-gen-gogo to build
-GOGO_PROTO_SHA="2752d97bbd91927dd1c43296dbf8700e50e2708c"
-GRPC_GATEWAY_SHA="f52d055dc48aec25854ed7d31862f78913cf17d1"
+GOGO_PROTO_SHA="5f813990bfffa3c2f4414dbea480e705ab280358"
+GRPC_GATEWAY_SHA="c8ec92d0481dd77d9b8c1808eb6476d190aa039a"
 
 # set up self-contained GOPATH for building
 export GOPATH=${PWD}/gopath
@@ -57,7 +57,7 @@ popd
 
 for dir in ${DIRS}; do
 	pushd ${dir}
-		protoc --gogofast_out=plugins=grpc,import_prefix=github.com/coreos/:. -I=.:"${GOGOPROTO_PATH}":"${COREOS_ROOT}":"${GRPC_GATEWAY_ROOT}/third_party/googleapis" *.proto
+		protoc --gofast_out=plugins=grpc,import_prefix=github.com/coreos/:. -I=.:"${GOGOPROTO_PATH}":"${COREOS_ROOT}":"${GRPC_GATEWAY_ROOT}/third_party/googleapis" *.proto
 		sed -i.bak -E "s/github\.com\/coreos\/(gogoproto|github\.com|golang\.org|google\.golang\.org)/\1/g" *.pb.go
 		sed -i.bak -E 's/github\.com\/coreos\/(errors|fmt|io)/\1/g' *.pb.go
 		sed -i.bak -E 's/import _ \"gogoproto\"//g' *.pb.go

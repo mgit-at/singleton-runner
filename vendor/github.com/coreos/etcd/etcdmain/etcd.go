@@ -43,6 +43,7 @@ import (
 	systemdutil "github.com/coreos/go-systemd/util"
 	"github.com/coreos/pkg/capnslog"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc"
 )
 
 type dirType string
@@ -56,7 +57,11 @@ var (
 )
 
 func startEtcdOrProxyV2() {
+	grpc.EnableTracing = false
+
 	cfg := newConfig()
+	defaultInitialCluster := cfg.InitialCluster
+
 	err := cfg.parse(os.Args[1:])
 	if err != nil {
 		plog.Errorf("error verifying flags, %v. See 'etcd --help'.", err)
@@ -80,7 +85,9 @@ func startEtcdOrProxyV2() {
 	plog.Infof("setting maximum number of CPUs to %d, total number of available CPUs is %d", GoMaxProcs, runtime.NumCPU())
 
 	// TODO: check whether fields are set instead of whether fields have default value
-	if cfg.Name != embed.DefaultName && cfg.InitialCluster == cfg.InitialClusterFromName(embed.DefaultName) {
+	defaultHost, defaultHostErr := cfg.IsDefaultHost()
+	defaultHostOverride := defaultHost == "" || defaultHostErr == nil
+	if (defaultHostOverride || cfg.Name != embed.DefaultName) && cfg.InitialCluster == defaultInitialCluster {
 		cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	}
 
@@ -160,12 +167,12 @@ func startEtcdOrProxyV2() {
 		// for accepting connections. The etcd instance should be
 		// joined with the cluster and ready to serve incoming
 		// connections.
-		err := daemon.SdNotify("READY=1")
+		sent, err := daemon.SdNotify("READY=1")
 		if err != nil {
 			plog.Errorf("failed to notify systemd for readiness: %v", err)
-			if err == daemon.SdNotifyNoSocket {
-				plog.Errorf("forgot to set Type=notify in systemd service file?")
-			}
+		}
+		if !sent {
+			plog.Errorf("forgot to set Type=notify in systemd service file?")
 		}
 	}
 
@@ -181,6 +188,15 @@ func startEtcdOrProxyV2() {
 
 // startEtcd runs StartEtcd in addition to hooks needed for standalone etcd.
 func startEtcd(cfg *embed.Config) (<-chan struct{}, <-chan error, error) {
+	defaultHost, dhErr := cfg.IsDefaultHost()
+	if defaultHost != "" {
+		if dhErr == nil {
+			plog.Infof("advertising using detected default host %q", defaultHost)
+		} else {
+			plog.Noticef("failed to detect default host, advertise falling back to %q (%v)", defaultHost, dhErr)
+		}
+	}
+
 	e, err := embed.StartEtcd(cfg)
 	if err != nil {
 		return nil, nil, err
@@ -255,15 +271,12 @@ func startProxy(cfg *config) error {
 	clientURLs := []string{}
 	uf := func() []string {
 		gcls, gerr := etcdserver.GetClusterFromRemotePeers(peerURLs, tr)
-		// TODO: remove the 2nd check when we fix GetClusterFromRemotePeers
-		// GetClusterFromRemotePeers should not return nil error with an invalid empty cluster
+
 		if gerr != nil {
 			plog.Warningf("proxy: %v", gerr)
 			return []string{}
 		}
-		if len(gcls.Members()) == 0 {
-			return clientURLs
-		}
+
 		clientURLs = gcls.ClientURLs()
 
 		urls := struct{ PeerURLs []string }{gcls.PeerURLs()}

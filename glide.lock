@@ -1,52 +1,48 @@
 hash: 1b5c3486d6c1b9a133c0fd606ed719e5b917593a0741bd06736c47170c00a13d
-updated: 2016-07-18T09:41:15.112524295+02:00
+updated: 2016-08-29T09:59:38.52855487+02:00
 imports:
 - name: github.com/cloudfoundry-incubator/candiedyaml
   version: 99c3df83b51532e3615f851d8c2dbb638f5313bf
 - name: github.com/coreos/etcd
-  version: 336e4f2f28799d901bd76f58372dc274fd45d777
+  version: e53b99588a05d1f4ef172c178d4ed8e8106b8be4
   subpackages:
-  - clientv3
   - auth/authpb
+  - clientv3
   - etcdserver/api/v3rpc/rpctypes
   - etcdserver/etcdserverpb
   - mvcc/mvccpb
   - pkg/tlsutil
 - name: github.com/ghodss/yaml
   version: aa0c862057666179de291b67d9f093d12b5a8473
-- name: github.com/gogo/protobuf
-  version: 2752d97bbd91927dd1c43296dbf8700e50e2708c
-  subpackages:
-  - proto
 - name: github.com/golang/protobuf
-  version: 874264fbbb43f4d91e999fecb4b40143ed611400
+  version: 888eb0692c857ec880338addf316bd662d5e630e
   subpackages:
-  - proto
   - jsonpb
+  - proto
 - name: github.com/grpc-ecosystem/grpc-gateway
-  version: f52d055dc48aec25854ed7d31862f78913cf17d1
+  version: 331418a167bc76e7e4e7469cf704033eddaba7a5
   subpackages:
   - runtime
-  - utilities
   - runtime/internal
+  - utilities
 - name: golang.org/x/net
-  version: 3797cd8864994d713d909eda5e61ede8683fdc12
+  version: 6250b412798208e6c90b03b7c4f226de5aa299e2
   subpackages:
   - context
   - http2
-  - trace
   - http2/hpack
-  - lex/httplex
   - internal/timeseries
+  - lex/httplex
+  - trace
 - name: google.golang.org/grpc
-  version: 02fca896ff5f50c6bbbee0860345a49344b37a03
+  version: 79b7c349179cdd6efd8bac4a1ce7f01b98c16e9b
   subpackages:
+  - codes
   - credentials
   - grpclog
-  - metadata
-  - codes
   - internal
+  - metadata
   - naming
-  - transport
   - peer
+  - transport
 testImports: []

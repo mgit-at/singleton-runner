@@ -42,7 +42,7 @@ before_install:
 
 # disable godep restore override
 install:
- - pushd cmd/ && go get -t -v ./... && popd
+ - pushd cmd/etcd && go get -t -v ./... && popd
 
 script:
  - >
@@ -54,6 +54,7 @@ script:
         GOARCH=386 PASSES="build unit" ./test
         ;;
       *)
-        GOARCH="${TARGET}" ./build
+        # test building out of gopath
+        GO_BUILD_FLAGS="-a -v" GOPATH=/bad-go-path GOARCH="${TARGET}" ./build
         ;;
     esac

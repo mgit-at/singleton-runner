@@ -21,22 +21,23 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/coreos/etcd/clientv3"
+	"github.com/coreos/etcd/etcdserver/api/v3rpc"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 )
 
 type watchProxy struct {
-	c   *clientv3.Client
+	cw  clientv3.Watcher
 	wgs watchergroups
 
 	mu           sync.Mutex
 	nextStreamID int64
 }
 
-func NewWatchProxy(c *clientv3.Client) *watchProxy {
+func NewWatchProxy(c *clientv3.Client) pb.WatchServer {
 	return &watchProxy{
-		c: c,
+		cw: c.Watcher,
 		wgs: watchergroups{
-			c:      c,
+			cw:     c.Watcher,
 			groups: make(map[watchRange]*watcherGroup),
 		},
 	}
@@ -48,8 +49,9 @@ func (wp *watchProxy) Watch(stream pb.Watch_WatchServer) (err error) {
 	wp.mu.Unlock()
 
 	sws := serverWatchStream{
-		c:      wp.c,
-		groups: wp.wgs,
+		cw:      wp.cw,
+		groups:  &wp.wgs,
+		singles: make(map[int64]*watcherSingle),
 
 		id:         wp.nextStreamID,
 		gRPCStream: stream,
@@ -67,10 +69,10 @@ func (wp *watchProxy) Watch(stream pb.Watch_WatchServer) (err error) {
 
 type serverWatchStream struct {
 	id int64
-	c  *clientv3.Client
+	cw clientv3.Watcher
 
 	mu      sync.Mutex // make sure any access of groups and singles is atomic
-	groups  watchergroups
+	groups  *watchergroups
 	singles map[int64]*watcherSingle
 
 	gRPCStream pb.Watch_WatchServer
@@ -81,7 +83,18 @@ type serverWatchStream struct {
 	nextWatcherID int64
 }
 
+func (sws *serverWatchStream) close() {
+	close(sws.watchCh)
+	close(sws.ctrlCh)
+	for _, ws := range sws.singles {
+		ws.stop()
+	}
+	sws.groups.stop()
+}
+
 func (sws *serverWatchStream) recvLoop() error {
+	defer sws.close()
+
 	for {
 		req, err := sws.gRPCStream.Recv()
 		if err == io.EOF {
@@ -104,25 +117,14 @@ func (sws *serverWatchStream) recvLoop() error {
 				ch: sws.watchCh,
 
 				progress: cr.ProgressNotify,
+				filters:  v3rpc.FiltersFromRequest(cr),
 			}
 			if cr.StartRevision != 0 {
 				sws.addDedicatedWatcher(watcher, cr.StartRevision)
 			} else {
 				sws.addCoalescedWatcher(watcher)
 			}
-
-			wresp := &pb.WatchResponse{
-				Header:  &pb.ResponseHeader{}, // TODO: fill in header
-				WatchId: sws.nextWatcherID,
-				Created: true,
-			}
-
 			sws.nextWatcherID++
-			select {
-			case sws.ctrlCh <- wresp:
-			default:
-				panic("handle this")
-			}
 
 		case *pb.WatchRequest_CancelRequest:
 			sws.removeWatcher(uv.CancelRequest.WatchId)
@@ -168,10 +170,11 @@ func (sws *serverWatchStream) addDedicatedWatcher(w watcher, rev int64) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	wch := sws.c.Watch(ctx,
+	wch := sws.cw.Watch(ctx,
 		w.wr.key, clientv3.WithRange(w.wr.end),
 		clientv3.WithRev(rev),
 		clientv3.WithProgressNotify(),
+		clientv3.WithCreatedNotify(),
 	)
 
 	ws := newWatcherSingle(wch, cancel, w, sws)
