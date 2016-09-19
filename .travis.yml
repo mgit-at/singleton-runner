@@ -1,0 +1,16 @@
+language: go
+
+sudo: required
+
+go:
+  - 1.7
+
+install:
+  - go get .
+
+script:
+  - set -e
+  - go vet .
+
+notifications:
+  - email: false
