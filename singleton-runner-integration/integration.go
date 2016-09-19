@@ -1,19 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -152,26 +153,44 @@ func (n *etcdNode) stop() error {
 	return nil
 }
 
-func waitAddr(addr string) error {
-	var conn net.Conn
-	var err error
+func waitNode(addr string) error {
+	var lastErr error
 	ticker := time.NewTicker(5 * time.Second)
-	for i := 0; i < 5; i++ {
-		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-		if err == nil {
-			conn.Close()
-			return nil
+	for i := 0; i < 10; i++ {
+		if i > 0 {
+			<-ticker.C
 		}
-		<-ticker.C
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+		}
+		resp, err := client.Get(fmt.Sprintf("%s/health", addr))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		defer resp.Body.Close()
+		status := struct {
+			Health string `json:"health"`
+		}{}
+		if err := json.NewDecoder(bufio.NewReader(resp.Body)).Decode(&status); err != nil {
+			lastErr = err
+			continue
+		}
+		if status.Health != "true" {
+			lastErr = fmt.Errorf("expected health=true, got health=%s", status.Health)
+			continue
+		}
+
+		lastErr = nil
+		break
 	}
 	ticker.Stop()
-	return err
+	return lastErr
 }
 
 func waitNodes(nodes []*etcdNode) error {
 	for _, node := range nodes {
-		addr := strings.TrimPrefix(node.clientAddr, "http://")
-		if err := waitAddr(addr); err != nil {
+		if err := waitNode(node.clientAddr); err != nil {
 			return err
 		}
 	}
@@ -251,6 +270,7 @@ func main() {
 		log.Fatalln("failed to install etcd:", err)
 	}
 
+	success := true
 	tests := []struct {
 		Name string
 		Func func(string) error
@@ -273,16 +293,21 @@ func main() {
 
 		if err := test.Func(etcdPath); err != nil {
 			log.Println("Test failed:", err)
+			success = false
 		} else {
 			log.Println("Success")
 		}
+	}
+
+	if !success {
+		os.Exit(1)
 	}
 }
 
 func TestSimple(etcdPath string) error {
 	nodes, err := startCluster(etcdPath, 1, 2, 3)
 	if err != nil {
-		log.Fatalln("failed to start cluster")
+		log.Fatalln("failed to start cluster", err)
 	}
 	defer func() {
 		for _, node := range nodes {
@@ -320,7 +345,7 @@ func TestSimple(etcdPath string) error {
 func TestLooseQuorum(etcdPath string) error {
 	nodes, err := startCluster(etcdPath, 1, 2)
 	if err != nil {
-		log.Fatalln("failed to start cluster")
+		log.Fatalln("failed to start cluster", err)
 	}
 	defer func() {
 		for _, node := range nodes {
@@ -391,7 +416,7 @@ func TestLooseQuorum(etcdPath string) error {
 			if err := nodes[0].start(etcdPath, getInitialCluster(nodes), "existing", false); err != nil {
 				log.Printf("failed to start %s: %v\n", nodes[0].name, err)
 			} else {
-				if err := waitNodes(nodes[:1]); err != nil {
+				if err := waitNode(nodes[0].clientAddr); err != nil {
 					log.Printf("failed to wait for %s: %v\n", nodes[0].name, err)
 				} else {
 					log.Println(nodes[0].name, "ready")
